@@ -108,3 +108,5 @@ Typical safe flow:
 - https://docs.z.ai/guides/capabilities/function-calling
 - https://docs.z.ai/guides/capabilities/thinking
 - https://docs.z.ai/guides/overview/concept-param
+
+- Agent push test: 2026-02-21T16:12:08Z
