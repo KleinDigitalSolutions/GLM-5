@@ -28,6 +28,14 @@ Interactive REPL:
 ./agent.sh --workspace ~/
 ```
 
+Das REPL zeigt oben jetzt ein ASCII-Header-Banner (`GLM-5 AGENT`) plus Panels fuer `Denken`, `Antwort` und Tool-Schritte.
+
+Fuer das schickere Terminal-Design (aehnlich AgentONE, mit Panels/Farben via `rich`):
+
+```bash
+python3 -m pip install --user --break-system-packages rich
+```
+
 Mit Shell-Bestaetigung vor jedem Shell-Toolcall:
 
 ```bash
@@ -38,6 +46,7 @@ REPL commands:
 
 - `/reset` reset conversation context
 - `/cwd` show current agent working directory
+- `/help` show command help
 - `/quit` exit
 
 Useful flags:
@@ -89,6 +98,7 @@ Useful flags:
 - API key is stored in `~/modal-glm5/.env` with permission `600`.
 - `chat.sh` uses `jq` for JSON parsing/output.
 - If `jq` is missing: `brew install jq`
+- `agent.py` nutzt optional `rich`; ohne `rich` faellt es automatisch auf Plain-Text zurueck.
 - For `gh_*` tools, authenticate once with: `gh auth login`
 
 ## Push/Merge safety flow
@@ -108,5 +118,3 @@ Typical safe flow:
 - https://docs.z.ai/guides/capabilities/function-calling
 - https://docs.z.ai/guides/capabilities/thinking
 - https://docs.z.ai/guides/overview/concept-param
-
-- Agent push test: 2026-02-21T16:12:08Z

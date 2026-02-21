@@ -17,6 +17,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+except ModuleNotFoundError:
+    Console = None
+    Panel = None
+    Text = None
+
 DEFAULT_BASE_URL = "https://api.us-west-2.modal.direct/v1"
 DEFAULT_MODEL = "zai-org/GLM-5-FP8"
 MAX_TOOL_RESULT_CHARS = 16000
@@ -44,6 +53,77 @@ DANGEROUS_PATTERNS = [
     r"(^|\s)mkfs(\.|\s|$)",
     r"(^|\s)dd\s+if=",
 ]
+
+
+class _PlainConsole:
+    def print(self, *args: Any, **_: Any) -> None:
+        print(*args)
+
+
+class TerminalUI:
+    def __init__(self) -> None:
+        self.rich_enabled = Console is not None and Panel is not None and Text is not None
+        self.console = Console() if self.rich_enabled else _PlainConsole()
+
+    def info(self, message: str) -> None:
+        if self.rich_enabled:
+            self.console.print(f"[dim]{message}[/dim]")
+        else:
+            self.console.print(message)
+
+    def warning(self, message: str) -> None:
+        if self.rich_enabled:
+            self.console.print(f"[yellow]{message}[/yellow]")
+        else:
+            self.console.print(message)
+
+    def error(self, message: str) -> None:
+        if self.rich_enabled:
+            self.console.print(f"[red]{message}[/red]")
+        else:
+            self.console.print(message)
+
+    def panel(self, title: str, content: str, border_style: str = "blue", no_wrap: bool = False) -> None:
+        if self.rich_enabled:
+            self.console.print(
+                Panel(
+                    Text(content or "", no_wrap=no_wrap),
+                    title=title,
+                    border_style=border_style,
+                    highlight=False,
+                )
+            )
+        else:
+            self.console.print(f"\n{title}:\n{content}")
+
+    def tools(self, step: int, max_steps: int, items: list[str]) -> None:
+        header = f"Tools ({len(items)}) [step {step}/{max_steps}]"
+        body = "\n".join(f"- {item}" for item in items) if items else "(none)"
+        self.panel(header, body, border_style="cyan")
+
+    def _banner_logo(self) -> str:
+        return (
+            "   ____ _     __  __      ____            _   \n"
+            "  / ___| |   |  \\/  |    / ___|___   __ _| |__\n"
+            " | |  _| |   | |\\/| |   | |   / _ \\ / _` | '_ \\\n"
+            " | |_| | |___| |  | |   | |__| (_) | (_| | |_) |\n"
+            "  \\____|_____|_|  |_|    \\____\\___/ \\__,_|_.__/\n"
+            "                   GLM-5 AGENT"
+        )
+
+    def banner(self, workspace: Path, model: str, approval_mode: str) -> None:
+        logo = self._banner_logo()
+        content = (
+            f"{logo}\n\n"
+            f"workspace: {workspace}\n"
+            f"model: {model}\n"
+            f"approval-mode: {approval_mode}\n"
+            "commands: /reset, /cwd, /help, /quit"
+        )
+        self.panel("GLM-5 Agent REPL", content, border_style="green", no_wrap=True)
+
+
+UI = TerminalUI()
 
 
 def load_env_file(env_path: Path) -> dict[str, str]:
@@ -152,6 +232,7 @@ class Agent:
         max_tool_steps: int,
         api_timeout: int,
         approval_mode: str,
+        ui: TerminalUI | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -166,6 +247,7 @@ class Agent:
         self.max_tool_steps = max_tool_steps
         self.api_timeout = api_timeout
         self.approval_mode = approval_mode
+        self.ui = ui or UI
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def reset(self) -> None:
@@ -245,8 +327,8 @@ class Agent:
             return False, f"approval-mode={self.approval_mode} requires an interactive TTY"
 
         args_preview = truncate(json.dumps(arguments, ensure_ascii=False), 600)
-        print(f"\nApproval required for tool `{tool_name}`", flush=True)
-        print(args_preview, flush=True)
+        self.ui.warning(f"Approval required for tool `{tool_name}`")
+        self.ui.panel("Tool Arguments", args_preview, border_style="yellow")
         try:
             answer = input("Ausfuehren? [y/N]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -1349,8 +1431,8 @@ class Agent:
             response = self._call_model()
             choices = response.get("choices") or []
             if not choices:
-                print("Fehler: keine choices im Modell-Response", flush=True)
-                print(json.dumps(response, indent=2, ensure_ascii=False), flush=True)
+                self.ui.error("Fehler: keine choices im Modell-Response")
+                self.ui.panel("Raw Response", json.dumps(response, indent=2, ensure_ascii=False), border_style="red")
                 return
 
             message = choices[0].get("message") or {}
@@ -1359,7 +1441,7 @@ class Agent:
             tool_calls = message.get("tool_calls") or []
 
             if reasoning and self.thinking_enabled:
-                print("\nDenken:\n" + reasoning, flush=True)
+                self.ui.panel("Denken", reasoning, border_style="yellow")
 
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
@@ -1372,7 +1454,7 @@ class Agent:
             self.messages.append(assistant_msg)
 
             if not tool_calls:
-                print("\nAntwort:\n" + (content if content.strip() else "(leer)"), flush=True)
+                self.ui.panel("Antwort", content if content.strip() else "(leer)", border_style="blue")
                 return
 
             fingerprint = json.dumps(
@@ -1382,16 +1464,15 @@ class Agent:
             )
             tool_fingerprints.append(fingerprint)
             if len(tool_fingerprints) >= 3 and tool_fingerprints[-1] == tool_fingerprints[-2] == tool_fingerprints[-3]:
-                print(
-                    "\nAntwort:\nAbbruch: identische Tool-Calls wurden 3x wiederholt. "
+                self.ui.panel(
+                    "Antwort",
+                    "Abbruch: identische Tool-Calls wurden 3x wiederholt. "
                     "Bitte Anfrage praezisieren oder --max-tool-steps anpassen.",
-                    flush=True,
+                    border_style="red",
                 )
                 return
 
-            print(f"\nTools ({len(tool_calls)}) [step {step}/{self.max_tool_steps}]:", flush=True)
-            for tc in tool_calls:
-                print(f"- {self._format_tool_brief(tc)}", flush=True)
+            self.ui.tools(step, self.max_tool_steps, [self._format_tool_brief(tc) for tc in tool_calls])
 
             for tc in tool_calls:
                 call_id = tc.get("id", "")
@@ -1421,10 +1502,10 @@ class Agent:
                 }
                 self.messages.append(tool_message)
 
-        print(
-            "\nAntwort:\n"
+        self.ui.panel(
+            "Antwort",
             "Max tool steps reached. Please refine the request or increase --max-tool-steps.",
-            flush=True,
+            border_style="red",
         )
 
 
@@ -1478,7 +1559,7 @@ def main() -> int:
 
     api_key = os.environ.get("MODAL_API_KEY") or env_values.get("MODAL_API_KEY")
     if not api_key:
-        print("Fehler: MODAL_API_KEY fehlt. Starte zuerst ./setup.sh oder export MODAL_API_KEY.")
+        UI.error("Fehler: MODAL_API_KEY fehlt. Starte zuerst ./setup.sh oder export MODAL_API_KEY.")
         return 1
 
     base_url = (
@@ -1491,7 +1572,7 @@ def main() -> int:
 
     workspace = Path(args.workspace).expanduser().resolve()
     if not workspace.exists() or not workspace.is_dir():
-        print(f"Fehler: workspace ist kein Verzeichnis: {workspace}")
+        UI.error(f"Fehler: workspace ist kein Verzeichnis: {workspace}")
         return 1
 
     agent = Agent(
@@ -1507,42 +1588,49 @@ def main() -> int:
         max_tool_steps=max(1, min(args.max_tool_steps, 40)),
         api_timeout=max(10, min(args.api_timeout, 600)),
         approval_mode=args.approval_mode,
+        ui=UI,
     )
 
     if args.prompt:
         agent.run_turn(" ".join(args.prompt))
         return 0
 
-    print("GLM-5 Agent REPL")
-    print(f"workspace: {agent.workspace}")
-    print(f"model: {agent.model}")
-    print(f"approval-mode: {agent.approval_mode}")
-    print("commands: /reset, /cwd, /quit")
+    UI.banner(agent.workspace, agent.model, agent.approval_mode)
 
     while True:
         try:
             user_input = input("\nDu> ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nBye.")
+            UI.info("Bye.")
             return 0
 
         if not user_input:
             continue
         if user_input in {"/quit", "/exit"}:
-            print("Bye.")
+            UI.info("Bye.")
             return 0
         if user_input == "/reset":
             agent.reset()
-            print("Kontext zurueckgesetzt.")
+            UI.info("Kontext zurueckgesetzt.")
             continue
         if user_input == "/cwd":
-            print(f"cwd: {agent.cwd}")
+            UI.info(f"cwd: {agent.cwd}")
+            continue
+        if user_input == "/help":
+            UI.panel(
+                "Commands",
+                "/reset: Konversation zuruecksetzen\n"
+                "/cwd: aktuelles Agent-Arbeitsverzeichnis\n"
+                "/help: diese Hilfe anzeigen\n"
+                "/quit: beenden",
+                border_style="green",
+            )
             continue
 
         try:
             agent.run_turn(user_input)
         except Exception as err:
-            print(f"Fehler: {err}")
+            UI.error(f"Fehler: {err}")
 
 
 if __name__ == "__main__":
