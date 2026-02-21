@@ -55,6 +55,7 @@ REPL commands:
 - `/experimental [status|toggle|on|off]` manage experimental flag
 - `/skills` list available local Codex skills from `~/.codex/skills`
 - `/review` show local git change snapshot
+- `/review --llm` run model-based code review on local diff
 - `/rename <thread-name>` rename current local thread label
 - `/new` reset chat context
 - `/resume` no-op resume on current thread
@@ -127,6 +128,7 @@ Useful flags:
 - If `jq` is missing: `brew install jq`
 - `agent.py` nutzt optional `rich`; ohne `rich` faellt es automatisch auf Plain-Text zurueck.
 - For `gh_*` tools, authenticate once with: `gh auth login`
+- `/review --llm` needs API availability; on endpoint errors it falls back to local review snapshot.
 
 ## Push/Merge safety flow
 

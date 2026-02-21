@@ -426,6 +426,76 @@ class Agent:
             f"{stat or '(none)'}"
         )
 
+    def review_llm(self) -> dict[str, Any]:
+        if not shutil_which("git"):
+            return {"ok": False, "error": "git is not installed."}
+        check = self._run_exec(["git", "rev-parse", "--is-inside-work-tree"], cwd=self.cwd, timeout=20)
+        if not check.get("ok"):
+            return {"ok": False, "error": f"Not a git repository at cwd: {self.cwd}"}
+
+        branch = self._run_exec(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.cwd, timeout=20).get(
+            "stdout", ""
+        ).strip()
+        local_snapshot = self.review_report()
+        diff_snapshot = self.diff_report()
+
+        review_system = (
+            "You are a strict senior software reviewer. "
+            "Prioritize concrete bugs, regressions, security issues, and missing tests. "
+            "Findings first (ordered by severity), then assumptions/open questions, then a brief summary."
+        )
+        review_user = (
+            f"Repository cwd: {self.cwd}\n"
+            f"Branch: {branch or '(unknown)'}\n\n"
+            "Local review snapshot:\n"
+            f"{local_snapshot}\n\n"
+            "Diff details:\n"
+            f"{truncate(diff_snapshot, 20000)}\n\n"
+            "Return concise markdown."
+        )
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": review_system},
+                {"role": "user", "content": review_user},
+            ],
+            "stream": False,
+            "max_tokens": min(self.max_tokens, 3500),
+            "temperature": 0.1,
+            "thinking": {"type": "disabled", "clear_thinking": True},
+        }
+        last_error = ""
+        response: dict[str, Any] | None = None
+        for _ in range(2):
+            try:
+                response = http_json_post(
+                    f"{self.base_url}/chat/completions",
+                    token=self.api_key,
+                    payload=payload,
+                    timeout=self.api_timeout,
+                )
+                break
+            except Exception as err:
+                last_error = str(err)
+                if "HTTP 502" in last_error or "Network timeout" in last_error:
+                    continue
+                return {"ok": False, "error": last_error}
+
+        if response is None:
+            return {"ok": False, "error": last_error or "LLM review request failed"}
+
+        choices = response.get("choices") or []
+        if not choices:
+            return {"ok": False, "error": "No choices in LLM response", "raw": response}
+
+        message = choices[0].get("message") or {}
+        content = str(message.get("content") or "").strip()
+        if not content:
+            content = "(empty review response)"
+
+        return {"ok": True, "content": content}
+
     def mention_file(self, path_value: str) -> dict[str, Any]:
         if not path_value.strip():
             return {"ok": False, "error": "usage: /mention <path>"}
@@ -1933,8 +2003,19 @@ def main() -> int:
             skills = agent.list_skills()
             UI.panel("Skills", "\n".join(f"- {s}" for s in skills) if skills else "(none found)", border_style="cyan")
             continue
-        if user_input == "/review":
-            UI.panel("Review", agent.review_report(), border_style="yellow")
+        if user_input.startswith("/review"):
+            parts = user_input.split()
+            use_llm = any(p in {"--llm", "-l", "llm"} for p in parts[1:])
+            if use_llm:
+                UI.info("Running LLM review...")
+                result = agent.review_llm()
+                if result.get("ok"):
+                    UI.panel("Review (LLM)", truncate(result.get("content", ""), 24000), border_style="yellow")
+                else:
+                    UI.warning(f"LLM review failed: {result.get('error', 'unknown error')}")
+                    UI.panel("Review (Fallback Local)", agent.review_report(), border_style="yellow")
+            else:
+                UI.panel("Review", agent.review_report(), border_style="yellow")
             continue
         if user_input.startswith("/rename"):
             arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
@@ -2074,6 +2155,7 @@ def main() -> int:
                 "/experimental: toggle experiment flags\n"
                 "/skills: verfuegbare Skills auflisten\n"
                 "/review: lokale Change-Review-Zusammenfassung\n"
+                "/review --llm: modellbasiertes Code-Review\n"
                 "/rename: Thread-Namen setzen\n"
                 "/new: neuen Chat-Kontext starten\n"
                 "/resume: aktiven Thread fortsetzen\n"
