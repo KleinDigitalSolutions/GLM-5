@@ -44,6 +44,33 @@ Mit Shell-Bestaetigung vor jedem Shell-Toolcall:
 
 REPL commands:
 
+- `/init` create starter `AGENTS.md` in current working directory
+- `/init --force` overwrite existing `AGENTS.md`
+- `/status` show session/runtime configuration
+- `/diff` show git diff (staged + unstaged + untracked)
+- `/model` show current model
+- `/model <model-id>` switch model for next turns
+- `/permissions` show current approval mode
+- `/permissions off|shell|all` update approval mode
+- `/experimental [status|toggle|on|off]` manage experimental flag
+- `/skills` list available local Codex skills from `~/.codex/skills`
+- `/review` show local git change snapshot
+- `/rename <thread-name>` rename current local thread label
+- `/new` reset chat context
+- `/resume` no-op resume on current thread
+- `/fork [name]` fork current local thread label
+- `/compact` compact context buffer (summary + keep recent messages)
+- `/plan [toggle|on|off]` toggle plan mode
+- `/collab [default|plan]` set collaboration mode
+- `/agent [thread-name]` show/set active local thread label
+- `/mention <path>` load file content into system context
+- `/statusline <comma-separated-items>` customize banner lines
+- `/mcp` list configured MCP tools (local agent reports none by default)
+- `/logout` local CLI logout info
+- `/feedback <message>` write feedback file to `./logs/`
+- `/ps` show local background session list
+- `/clean` clear local background session list
+- `/personality <style>` set communication style hint
 - `/reset` reset conversation context
 - `/cwd` show current agent working directory
 - `/help` show command help

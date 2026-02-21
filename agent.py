@@ -45,6 +45,33 @@ Rules:
 - Respect workspace boundaries and avoid destructive commands unless explicitly requested.
 """
 
+AGENTS_MD_TEMPLATE = """# AGENTS.md
+
+## Mission
+- Build and maintain this project with small, safe, and verifiable changes.
+
+## Workflow
+1. Understand the task and constraints first.
+2. Make the smallest reasonable code change.
+3. Run checks/tests after edits.
+4. Summarize what changed and why.
+
+## Engineering Rules
+- Keep commits focused and readable.
+- Prefer fixing root causes over quick patches.
+- Avoid destructive commands unless explicitly requested.
+- Never commit secrets (`.env`, API keys, tokens).
+
+## Project Commands
+- Install: TODO
+- Dev run: TODO
+- Test: TODO
+- Lint/Format: TODO
+
+## Notes
+- Fill this file with project-specific standards and runbooks.
+"""
+
 DANGEROUS_PATTERNS = [
     r"(^|\s)sudo(\s|$)",
     r"(^|\s)shutdown(\s|$)",
@@ -111,15 +138,10 @@ class TerminalUI:
             "                   GLM-5 AGENT"
         )
 
-    def banner(self, workspace: Path, model: str, approval_mode: str) -> None:
+    def banner(self, lines: list[str]) -> None:
         logo = self._banner_logo()
-        content = (
-            f"{logo}\n\n"
-            f"workspace: {workspace}\n"
-            f"model: {model}\n"
-            f"approval-mode: {approval_mode}\n"
-            "commands: /reset, /cwd, /help, /quit"
-        )
+        body = "\n".join(lines)
+        content = f"{logo}\n\n{body}"
         self.panel("GLM-5 Agent REPL", content, border_style="green", no_wrap=True)
 
 
@@ -248,10 +270,211 @@ class Agent:
         self.api_timeout = api_timeout
         self.approval_mode = approval_mode
         self.ui = ui or UI
+        self.thread_name = "default"
+        self.collab_mode = "default"
+        self.plan_mode = False
+        self.personality = "default"
+        self.experimental_flags: dict[str, bool] = {"enhanced_diff": True}
+        self.statusline_items = ["workspace", "model", "approval-mode", "thread", "personality"]
+        self.background_sessions: list[str] = []
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._refresh_system_prompt()
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._refresh_system_prompt()
+
+    def _refresh_system_prompt(self) -> None:
+        style_line = "" if self.personality == "default" else f"\nCommunication style override: {self.personality}."
+        collab_line = f"\nCollaboration mode: {self.collab_mode}."
+        plan_line = f"\nPlan mode: {'on' if self.plan_mode else 'off'}."
+        self.messages[0]["content"] = SYSTEM_PROMPT + style_line + collab_line + plan_line
+
+    def init_agents_md(self, force: bool = False) -> dict[str, Any]:
+        target = self.cwd / "AGENTS.md"
+        if target.exists() and not force:
+            return {
+                "ok": False,
+                "error": "AGENTS.md exists already (use /init --force to overwrite)",
+                "path": str(target),
+            }
+
+        target.write_text(AGENTS_MD_TEMPLATE, encoding="utf-8")
+        return {"ok": True, "path": str(target), "bytes_written": len(AGENTS_MD_TEMPLATE.encode("utf-8"))}
+
+    def set_model(self, model_name: str) -> dict[str, Any]:
+        value = model_name.strip()
+        if not value:
+            return {"ok": False, "error": "model name is empty"}
+        old = self.model
+        self.model = value
+        return {"ok": True, "old_model": old, "new_model": self.model}
+
+    def set_permissions(self, mode: str) -> dict[str, Any]:
+        value = mode.strip().lower()
+        if value not in {"off", "shell", "all"}:
+            return {"ok": False, "error": "permissions must be one of: off, shell, all"}
+        old = self.approval_mode
+        self.approval_mode = value
+        return {"ok": True, "old_permissions": old, "new_permissions": self.approval_mode}
+
+    def set_personality(self, style: str) -> dict[str, Any]:
+        value = style.strip().lower()
+        if not value:
+            return {"ok": False, "error": "personality is empty"}
+        self.personality = value
+        self._refresh_system_prompt()
+        return {"ok": True, "personality": self.personality}
+
+    def set_collab_mode(self, mode: str) -> dict[str, Any]:
+        value = mode.strip().lower()
+        if value not in {"default", "plan"}:
+            return {"ok": False, "error": "collab must be one of: default, plan"}
+        self.collab_mode = value
+        self.plan_mode = value == "plan"
+        self._refresh_system_prompt()
+        return {"ok": True, "collab_mode": self.collab_mode, "plan_mode": self.plan_mode}
+
+    def set_statusline_items(self, raw: str) -> dict[str, Any]:
+        valid = {"workspace", "model", "approval-mode", "thread", "personality", "cwd", "plan", "collab"}
+        items = [part.strip().lower() for part in raw.split(",") if part.strip()]
+        if not items:
+            return {"ok": False, "error": "statusline list is empty"}
+        invalid = [x for x in items if x not in valid]
+        if invalid:
+            return {"ok": False, "error": f"invalid statusline item(s): {', '.join(invalid)}"}
+        self.statusline_items = items
+        return {"ok": True, "statusline_items": self.statusline_items}
+
+    def banner_lines(self) -> list[str]:
+        values = {
+            "workspace": f"workspace: {self.workspace}",
+            "model": f"model: {self.model}",
+            "approval-mode": f"approval-mode: {self.approval_mode}",
+            "thread": f"thread: {self.thread_name}",
+            "personality": f"personality: {self.personality}",
+            "cwd": f"cwd: {self.cwd}",
+            "plan": f"plan-mode: {'on' if self.plan_mode else 'off'}",
+            "collab": f"collab-mode: {self.collab_mode}",
+        }
+        lines = [values[key] for key in self.statusline_items if key in values]
+        lines.append("commands: /help")
+        return lines
+
+    def status_report(self) -> str:
+        approx_tokens = int(sum(len(json.dumps(m, ensure_ascii=False)) for m in self.messages) / 4)
+        return (
+            f"thread: {self.thread_name}\n"
+            f"workspace: {self.workspace}\n"
+            f"cwd: {self.cwd}\n"
+            f"model: {self.model}\n"
+            f"permissions: {self.approval_mode}\n"
+            f"personality: {self.personality}\n"
+            f"collab-mode: {self.collab_mode}\n"
+            f"plan-mode: {'on' if self.plan_mode else 'off'}\n"
+            f"thinking: {'on' if self.thinking_enabled else 'off'}\n"
+            f"preserve-thinking: {'on' if self.preserve_thinking else 'off'}\n"
+            f"messages: {len(self.messages)}\n"
+            f"approx-context-tokens: {approx_tokens}\n"
+            f"rich-ui: {'on' if self.ui.rich_enabled else 'off'}\n"
+            f"statusline-items: {', '.join(self.statusline_items)}"
+        )
+
+    def diff_report(self) -> str:
+        if not shutil_which("git"):
+            return "git is not installed."
+        check = self._run_exec(["git", "rev-parse", "--is-inside-work-tree"], cwd=self.cwd, timeout=20)
+        if not check.get("ok"):
+            return f"Not a git repository at cwd: {self.cwd}"
+
+        staged = self._run_exec(["git", "diff", "--staged"], cwd=self.cwd, timeout=40)
+        unstaged = self._run_exec(["git", "diff"], cwd=self.cwd, timeout=40)
+        untracked = self._run_exec(
+            ["git", "ls-files", "--others", "--exclude-standard"], cwd=self.cwd, timeout=20
+        )
+
+        parts = []
+        parts.append("## Staged diff")
+        parts.append(staged.get("stdout", "").strip() or "(none)")
+        parts.append("\n## Unstaged diff")
+        parts.append(unstaged.get("stdout", "").strip() or "(none)")
+        parts.append("\n## Untracked files")
+        parts.append(untracked.get("stdout", "").strip() or "(none)")
+        return truncate("\n".join(parts), 24000)
+
+    def review_report(self) -> str:
+        if not shutil_which("git"):
+            return "git is not installed."
+        check = self._run_exec(["git", "rev-parse", "--is-inside-work-tree"], cwd=self.cwd, timeout=20)
+        if not check.get("ok"):
+            return f"Not a git repository at cwd: {self.cwd}"
+
+        stat = self._run_exec(["git", "diff", "--stat"], cwd=self.cwd, timeout=30).get("stdout", "").strip()
+        staged = self._run_exec(["git", "diff", "--staged", "--stat"], cwd=self.cwd, timeout=30).get("stdout", "").strip()
+        files = self._run_exec(["git", "diff", "--name-only"], cwd=self.cwd, timeout=20).get("stdout", "").strip()
+        staged_files = self._run_exec(["git", "diff", "--staged", "--name-only"], cwd=self.cwd, timeout=20).get("stdout", "").strip()
+
+        return (
+            "Local review snapshot\n\n"
+            "Staged files:\n"
+            f"{staged_files or '(none)'}\n\n"
+            "Unstaged files:\n"
+            f"{files or '(none)'}\n\n"
+            "Staged stat:\n"
+            f"{staged or '(none)'}\n\n"
+            "Unstaged stat:\n"
+            f"{stat or '(none)'}"
+        )
+
+    def mention_file(self, path_value: str) -> dict[str, Any]:
+        if not path_value.strip():
+            return {"ok": False, "error": "usage: /mention <path>"}
+        try:
+            path = self._resolve_path(path_value.strip(), must_exist=True)
+        except ValueError as err:
+            return {"ok": False, "error": str(err)}
+        if path.is_dir():
+            return {"ok": False, "error": f"path is a directory: {path}"}
+
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        snippet = truncate(raw, 6000)
+        rel = str(path.relative_to(self.workspace))
+        self.messages.append(
+            {
+                "role": "system",
+                "content": f"User mentioned file `{rel}`. Use this content as context:\n\n{snippet}",
+            }
+        )
+        return {"ok": True, "path": str(path), "chars_loaded": len(snippet)}
+
+    def compact_context(self) -> dict[str, Any]:
+        if len(self.messages) <= 12:
+            return {"ok": True, "compacted": False, "reason": "context already small"}
+
+        old = self.messages[1:-10]
+        summary_lines: list[str] = []
+        for msg in old:
+            role = msg.get("role", "unknown")
+            content = str(msg.get("content", "")).strip().replace("\n", " ")
+            if not content:
+                continue
+            summary_lines.append(f"- {role}: {content[:180]}")
+            if len(summary_lines) >= 30:
+                break
+
+        summary = "Compacted conversation summary:\n" + ("\n".join(summary_lines) if summary_lines else "- (no summary)")
+        self.messages = [self.messages[0], {"role": "system", "content": summary}, *self.messages[-10:]]
+        return {"ok": True, "compacted": True, "messages_now": len(self.messages)}
+
+    def list_skills(self) -> list[str]:
+        root = Path.home() / ".codex" / "skills"
+        found: list[str] = []
+        if not root.exists():
+            return found
+        for skill_md in root.rglob("SKILL.md"):
+            rel = skill_md.parent.relative_to(root)
+            found.append(str(rel))
+        return sorted(found)
 
     def _resolve_path(self, value: str, must_exist: bool = False) -> Path:
         raw = Path(value).expanduser()
@@ -1595,7 +1818,7 @@ def main() -> int:
         agent.run_turn(" ".join(args.prompt))
         return 0
 
-    UI.banner(agent.workspace, agent.model, agent.approval_mode)
+    UI.banner(agent.banner_lines())
 
     while True:
         try:
@@ -1616,15 +1839,266 @@ def main() -> int:
         if user_input == "/cwd":
             UI.info(f"cwd: {agent.cwd}")
             continue
+        if user_input.startswith("/init"):
+            force = user_input.strip().split(maxsplit=1)[-1] in {"--force", "-f", "force"} if " " in user_input else False
+            result = agent.init_agents_md(force=force)
+            if result.get("ok"):
+                UI.panel(
+                    "Init",
+                    f"Created: {result['path']}\n"
+                    "Starter AGENTS.md generated.\n"
+                    "Edit it with your project-specific commands and standards.",
+                    border_style="green",
+                )
+            else:
+                UI.warning(result.get("error", "Init failed"))
+                if result.get("path"):
+                    UI.info(f"path: {result['path']}")
+            continue
+        if user_input.startswith("/statusline"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            if not arg:
+                UI.panel(
+                    "Statusline",
+                    "usage: /statusline workspace,model,approval-mode,thread,personality,cwd,plan,collab\n"
+                    f"current: {', '.join(agent.statusline_items)}",
+                    border_style="cyan",
+                )
+            else:
+                result = agent.set_statusline_items(arg)
+                if result.get("ok"):
+                    UI.panel("Statusline", f"updated: {', '.join(agent.statusline_items)}", border_style="green")
+                    UI.banner(agent.banner_lines())
+                else:
+                    UI.error(result.get("error", "statusline update failed"))
+            continue
+        if user_input == "/status":
+            UI.panel("Status", agent.status_report(), border_style="cyan")
+            continue
+        if user_input == "/diff":
+            UI.panel("Diff", agent.diff_report(), border_style="magenta")
+            continue
+        if user_input.startswith("/model"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            if not arg:
+                UI.panel("Model", f"current model: {agent.model}\nusage: /model <model-id>", border_style="cyan")
+            else:
+                result = agent.set_model(arg)
+                if result.get("ok"):
+                    UI.panel(
+                        "Model",
+                        f"changed model:\nold: {result['old_model']}\nnew: {result['new_model']}",
+                        border_style="green",
+                    )
+                    UI.banner(agent.banner_lines())
+                else:
+                    UI.error(result.get("error", "model update failed"))
+            continue
+        if user_input.startswith("/permissions"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            if not arg:
+                UI.panel(
+                    "Permissions",
+                    f"current: {agent.approval_mode}\nusage: /permissions off|shell|all",
+                    border_style="cyan",
+                )
+            else:
+                result = agent.set_permissions(arg)
+                if result.get("ok"):
+                    UI.panel(
+                        "Permissions",
+                        f"changed permissions:\nold: {result['old_permissions']}\nnew: {result['new_permissions']}",
+                        border_style="green",
+                    )
+                    UI.banner(agent.banner_lines())
+                else:
+                    UI.error(result.get("error", "permissions update failed"))
+            continue
+        if user_input.startswith("/experimental"):
+            arg = user_input.split(maxsplit=1)[1].strip().lower() if " " in user_input else "status"
+            if arg in {"status", "show"}:
+                flags = "\n".join(f"- {k}: {'on' if v else 'off'}" for k, v in agent.experimental_flags.items())
+                UI.panel("Experimental", flags or "(none)", border_style="cyan")
+            elif arg in {"toggle", "on", "off"}:
+                key = "enhanced_diff"
+                if arg == "toggle":
+                    agent.experimental_flags[key] = not agent.experimental_flags.get(key, False)
+                else:
+                    agent.experimental_flags[key] = arg == "on"
+                UI.panel("Experimental", f"{key}: {'on' if agent.experimental_flags[key] else 'off'}", border_style="green")
+            else:
+                UI.error("usage: /experimental [status|toggle|on|off]")
+            continue
+        if user_input == "/skills":
+            skills = agent.list_skills()
+            UI.panel("Skills", "\n".join(f"- {s}" for s in skills) if skills else "(none found)", border_style="cyan")
+            continue
+        if user_input == "/review":
+            UI.panel("Review", agent.review_report(), border_style="yellow")
+            continue
+        if user_input.startswith("/rename"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            if not arg:
+                UI.error("usage: /rename <thread-name>")
+            else:
+                agent.thread_name = arg
+                UI.panel("Rename", f"thread set to: {agent.thread_name}", border_style="green")
+                UI.banner(agent.banner_lines())
+            continue
+        if user_input == "/new":
+            agent.reset()
+            UI.panel("New", "Started a new chat context.", border_style="green")
+            continue
+        if user_input == "/resume":
+            UI.panel("Resume", "Current thread is active. Nothing to resume.", border_style="cyan")
+            continue
+        if user_input.startswith("/fork"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            fork_name = arg or f"{agent.thread_name}-fork-{int(datetime.now(timezone.utc).timestamp())}"
+            agent.thread_name = fork_name
+            UI.panel("Fork", f"forked thread name: {agent.thread_name}", border_style="green")
+            UI.banner(agent.banner_lines())
+            continue
+        if user_input == "/compact":
+            result = agent.compact_context()
+            if result.get("ok"):
+                UI.panel(
+                    "Compact",
+                    f"compacted: {result.get('compacted', False)}\nmessages: {result.get('messages_now', len(agent.messages))}",
+                    border_style="green",
+                )
+            else:
+                UI.error(result.get("error", "compact failed"))
+            continue
+        if user_input.startswith("/plan"):
+            arg = user_input.split(maxsplit=1)[1].strip().lower() if " " in user_input else "toggle"
+            if arg not in {"toggle", "on", "off"}:
+                UI.error("usage: /plan [toggle|on|off]")
+            else:
+                if arg == "toggle":
+                    agent.plan_mode = not agent.plan_mode
+                else:
+                    agent.plan_mode = arg == "on"
+                agent.collab_mode = "plan" if agent.plan_mode else "default"
+                agent._refresh_system_prompt()
+                UI.panel("Plan", f"plan-mode: {'on' if agent.plan_mode else 'off'}", border_style="green")
+                UI.banner(agent.banner_lines())
+            continue
+        if user_input.startswith("/collab"):
+            arg = user_input.split(maxsplit=1)[1].strip().lower() if " " in user_input else ""
+            if not arg:
+                UI.panel("Collab", f"current: {agent.collab_mode}\nusage: /collab default|plan", border_style="cyan")
+            else:
+                result = agent.set_collab_mode(arg)
+                if result.get("ok"):
+                    UI.panel(
+                        "Collab",
+                        f"collab-mode: {result['collab_mode']}\nplan-mode: {'on' if result['plan_mode'] else 'off'}",
+                        border_style="green",
+                    )
+                    UI.banner(agent.banner_lines())
+                else:
+                    UI.error(result.get("error", "collab update failed"))
+            continue
+        if user_input.startswith("/agent"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            if not arg:
+                UI.panel("Agent", f"active thread: {agent.thread_name}\nusage: /agent <thread-name>", border_style="cyan")
+            else:
+                agent.thread_name = arg
+                UI.panel("Agent", f"active thread set to: {agent.thread_name}", border_style="green")
+                UI.banner(agent.banner_lines())
+            continue
+        if user_input.startswith("/mention"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            result = agent.mention_file(arg)
+            if result.get("ok"):
+                UI.panel(
+                    "Mention",
+                    f"loaded file context:\npath: {result['path']}\nchars: {result['chars_loaded']}",
+                    border_style="green",
+                )
+            else:
+                UI.error(result.get("error", "mention failed"))
+            continue
+        if user_input == "/mcp":
+            UI.panel("MCP", "No MCP tools configured in this local agent.", border_style="cyan")
+            continue
+        if user_input == "/logout":
+            UI.panel("Logout", "No Codex account session in this local CLI. Nothing to log out.", border_style="cyan")
+            continue
+        if user_input.startswith("/feedback"):
+            feedback = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            if not feedback:
+                UI.error("usage: /feedback <message>")
+            else:
+                logs_dir = agent.cwd / "logs"
+                logs_dir.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+                path = logs_dir / f"feedback-{stamp}.txt"
+                path.write_text(feedback + "\n", encoding="utf-8")
+                UI.panel("Feedback", f"saved: {path}", border_style="green")
+            continue
+        if user_input == "/ps":
+            if agent.background_sessions:
+                UI.panel("Background Sessions", "\n".join(agent.background_sessions), border_style="cyan")
+            else:
+                UI.panel("Background Sessions", "(none)", border_style="cyan")
+            continue
+        if user_input == "/clean":
+            count = len(agent.background_sessions)
+            agent.background_sessions = []
+            UI.panel("Clean", f"stopped background sessions: {count}", border_style="green")
+            continue
+        if user_input.startswith("/personality"):
+            arg = user_input.split(maxsplit=1)[1].strip() if " " in user_input else ""
+            if not arg:
+                UI.panel("Personality", f"current: {agent.personality}\nusage: /personality <style>", border_style="cyan")
+            else:
+                result = agent.set_personality(arg)
+                if result.get("ok"):
+                    UI.panel("Personality", f"set to: {result['personality']}", border_style="green")
+                    UI.banner(agent.banner_lines())
+                else:
+                    UI.error(result.get("error", "personality update failed"))
+            continue
         if user_input == "/help":
             UI.panel(
                 "Commands",
+                "/init: AGENTS.md anlegen\n"
+                "/init --force: AGENTS.md ueberschreiben\n"
+                "/status: Session-Status anzeigen\n"
+                "/diff: git diff inkl. untracked files\n"
+                "/model: Modell anzeigen/setzen\n"
+                "/permissions: approval-mode anzeigen/setzen\n"
+                "/experimental: toggle experiment flags\n"
+                "/skills: verfuegbare Skills auflisten\n"
+                "/review: lokale Change-Review-Zusammenfassung\n"
+                "/rename: Thread-Namen setzen\n"
+                "/new: neuen Chat-Kontext starten\n"
+                "/resume: aktiven Thread fortsetzen\n"
+                "/fork: Thread-Namen fork setzen\n"
+                "/compact: Kontext komprimieren\n"
+                "/plan: plan-mode togglen\n"
+                "/collab: collaboration mode setzen\n"
+                "/agent: aktiven Thread setzen\n"
+                "/mention: Datei in Kontext laden\n"
+                "/statusline: Banner-Statuszeilen konfigurieren\n"
+                "/mcp: MCP-Tools anzeigen\n"
+                "/logout: lokale Logout-Info\n"
+                "/feedback: Feedback in logs speichern\n"
+                "/ps: Background-Sessions anzeigen\n"
+                "/clean: Background-Sessions leeren\n"
+                "/personality: Kommunikationsstil setzen\n"
                 "/reset: Konversation zuruecksetzen\n"
                 "/cwd: aktuelles Agent-Arbeitsverzeichnis\n"
                 "/help: diese Hilfe anzeigen\n"
                 "/quit: beenden",
                 border_style="green",
             )
+            continue
+        if user_input.startswith("/"):
+            UI.warning(f"Unknown command: {user_input}. Use /help.")
             continue
 
         try:
